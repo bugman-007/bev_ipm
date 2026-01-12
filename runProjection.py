@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import argparse
-import cv2
 import os
+from datetime import datetime
 
-from bev.projection import project_ego_grid_to_image_maps
-from typing import Optional
-from bev.nuscenes_io import init_nuscenes, select_sample, CAM_CHANNELS_6
-from bev.utils import info
+import cv2
 import numpy as np
-from bev.nuscenes_io import get_camera_calibration_for_sample
+
 from bev.bev_grid import make_bev_grid
-from bev.stitching import feather_weight, blend_bev
+from bev.nuscenes_io import (
+    CAM_CHANNELS_6,
+    get_camera_calibration_for_sample,
+    init_nuscenes,
+    select_sample,
+)
+from bev.projection import project_ego_grid_to_image_maps
+from bev.stitching import blend_bev, feather_weight
+from bev.utils import info
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +40,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=str, default="output_bev.png")
     p.add_argument("--feather", type=int, default=51, help="Gaussian kernel for blending weights (odd integer)")
     p.add_argument("--save_wsum", action="store_true", help="Save weight-sum visualization")
+
+    # Step-6 (still Phase-1): suppress far/horizon stretching
+    p.add_argument("--tau", type=float, default=20.0, help="Distance falloff (meters). Smaller = less far-field smear")
+
+    # Optional display convention: make +x (forward) point upward in the output image
+    p.add_argument("--flipud", action="store_true", help="Flip output vertically so forward (+x) is up")
+
+    # Avoid mixing outputs across runs
+    p.add_argument("--auto_debug_dir", action="store_true", help="Append run info to debug_dir (recommended)")
+
 
     return p.parse_args()
 
@@ -93,9 +108,19 @@ def main() -> None:
     info(f"Top-left ego point (approx): x={grid.xs[0,0]:.3f}, y={grid.ys[0,0]:.3f}")
     info(f"Bottom-right ego point (approx): x={grid.xs[-1,-1]:.3f}, y={grid.ys[-1,-1]:.3f}")
     
-    os.makedirs(args.debug_dir, exist_ok=True)
+    # Make debug dir unique per run to avoid mixing outputs across different bounds/res
+    debug_dir = args.debug_dir
+    if args.auto_debug_dir:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = f"{args.scene}_idx{args.index}_x{args.x_min}_{args.x_max}_y{args.y_min}_{args.y_max}_res{args.res}_{stamp}"
+        debug_dir = os.path.join(debug_dir, tag)
+
+    os.makedirs(debug_dir, exist_ok=True)
 
     info("=== Step 4: Per-camera remap + BEV projection debug ===")
+    # Precompute BEV distance (meters) for falloff weighting (reduces far/horizon smear)
+    dist = np.sqrt(grid.xs**2 + grid.ys**2).astype(np.float32)
+    falloff = np.exp(-dist / float(args.tau)).astype(np.float32)
 
     images = []
     weights = []
@@ -121,25 +146,33 @@ def main() -> None:
         bev[~valid] = 0
 
         # Debug per-camera
-        out_path = os.path.join(args.debug_dir, f"{ch}_bev.png")
+        out_path = os.path.join(debug_dir, f"{ch}_bev.png")
         cv2.imwrite(out_path, bev)
         info(f"{ch}: saved {out_path} | valid ratio={float(valid.mean()):.3f}")
 
         # Feather weight for blending
         w = feather_weight(valid, ksize=args.feather)
+        w *= falloff
 
         images.append(bev)
         weights.append(w)
 
     # Blend
     final_bev = blend_bev(images, weights)
+
+    if args.flipud:
+        final_bev = np.flipud(final_bev)
+
     cv2.imwrite(args.out, final_bev)
     info(f"Saved stitched BEV: {args.out}")
+
 
     if args.save_wsum:
         wsum = np.clip(np.sum(np.stack(weights, axis=0), axis=0), 0, 1)
         wsum_vis = (wsum * 255).astype(np.uint8)
-        cv2.imwrite(os.path.join(args.debug_dir, "wsum.png"), wsum_vis)
+        if args.flipud:
+            wsum_vis = np.flipud(wsum_vis)
+        cv2.imwrite(os.path.join(debug_dir, "wsum.png"), wsum_vis)
 
 
 
