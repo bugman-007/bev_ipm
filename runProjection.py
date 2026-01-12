@@ -6,13 +6,12 @@ import os
 
 from bev.projection import project_ego_grid_to_image_maps
 from typing import Optional
-
 from bev.nuscenes_io import init_nuscenes, select_sample, CAM_CHANNELS_6
 from bev.utils import info
-
 import numpy as np
 from bev.nuscenes_io import get_camera_calibration_for_sample
 from bev.bev_grid import make_bev_grid
+from bev.stitching import feather_weight, blend_bev
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,12 +30,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--y_min", type=float, default=-30.0)
     p.add_argument("--y_max", type=float, default=30.0)
     p.add_argument("--res", type=float, default=0.05, help="meters per pixel")
-
-    # output placeholder (used in later steps; kept for interface stability)
-    p.add_argument("--out", type=str, default="output.png", help="Output image path (used in later steps)")
-
     p.add_argument("--quiet", action="store_true", help="Less verbose nuScenes init")
     p.add_argument("--debug_dir", type=str, default="debug", help="Where to save per-camera debug BEV images")
+    p.add_argument("--out", type=str, default="output_bev.png")
+    p.add_argument("--feather", type=int, default=51, help="Gaussian kernel for blending weights (odd integer)")
+    p.add_argument("--save_wsum", action="store_true", help="Save weight-sum visualization")
+
     return p.parse_args()
 
 
@@ -98,6 +97,9 @@ def main() -> None:
 
     info("=== Step 4: Per-camera remap + BEV projection debug ===")
 
+    images = []
+    weights = []
+
     for ch in CAM_CHANNELS_6:
         cf = selection.cameras[ch]
         c = calibs[ch]
@@ -116,15 +118,29 @@ def main() -> None:
         )
 
         bev = cv2.remap(img, map_u, map_v, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-
-        # Apply mask (set invalid to black)
         bev[~valid] = 0
 
+        # Debug per-camera
         out_path = os.path.join(args.debug_dir, f"{ch}_bev.png")
         cv2.imwrite(out_path, bev)
+        info(f"{ch}: saved {out_path} | valid ratio={float(valid.mean()):.3f}")
 
-        valid_ratio = float(valid.mean())
-        info(f"{ch}: saved {out_path} | valid ratio={valid_ratio:.3f}")
+        # Feather weight for blending
+        w = feather_weight(valid, ksize=args.feather)
+
+        images.append(bev)
+        weights.append(w)
+
+    # Blend
+    final_bev = blend_bev(images, weights)
+    cv2.imwrite(args.out, final_bev)
+    info(f"Saved stitched BEV: {args.out}")
+
+    if args.save_wsum:
+        wsum = np.clip(np.sum(np.stack(weights, axis=0), axis=0), 0, 1)
+        wsum_vis = (wsum * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(args.debug_dir, "wsum.png"), wsum_vis)
+
 
 
 if __name__ == "__main__":
