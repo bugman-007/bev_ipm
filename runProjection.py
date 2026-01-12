@@ -61,17 +61,17 @@ def main() -> None:
 
     calibs = get_camera_calibration_for_sample(nusc, selection)
 
-info("=== Step 2: Calibration & ego pose matrices ===")
-for ch in CAM_CHANNELS_6:
-    c = calibs[ch]
-    info(f"{ch}:")
-    info("  K (intrinsics):")
-    info(str(np.array2string(c.K, precision=3, suppress_small=True)))
-    info("  T_cam_from_ego (ego -> cam):")
-    info(str(np.array2string(c.T_cam_from_ego, precision=3, suppress_small=True)))
-    info("  T_ego_from_cam (cam -> ego):")
-    info(str(np.array2string(c.T_ego_from_cam, precision=3, suppress_small=True)))
-    info("")
+    info("=== Step 2: Calibration & ego pose matrices ===")
+    for ch in CAM_CHANNELS_6:
+        c = calibs[ch]
+        info(f"{ch}:")
+        info("  K (intrinsics):")
+        info(str(np.array2string(c.K, precision=3, suppress_small=True)))
+        info("  T_cam_from_ego (ego -> cam):")
+        info(str(np.array2string(c.T_cam_from_ego, precision=3, suppress_small=True)))
+        info("  T_ego_from_cam (cam -> ego):")
+        info(str(np.array2string(c.T_ego_from_cam, precision=3, suppress_small=True)))
+        info("")
 
 
 if __name__ == "__main__":
