@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import cv2
+import os
+
+from bev.projection import project_ego_grid_to_image_maps
 from typing import Optional
 
 from bev.nuscenes_io import init_nuscenes, select_sample, CAM_CHANNELS_6
@@ -32,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=str, default="output.png", help="Output image path (used in later steps)")
 
     p.add_argument("--quiet", action="store_true", help="Less verbose nuScenes init")
+    p.add_argument("--debug_dir", type=str, default="debug", help="Where to save per-camera debug BEV images")
     return p.parse_args()
 
 
@@ -88,6 +93,38 @@ def main() -> None:
     # Print a few sanity points (meters)
     info(f"Top-left ego point (approx): x={grid.xs[0,0]:.3f}, y={grid.ys[0,0]:.3f}")
     info(f"Bottom-right ego point (approx): x={grid.xs[-1,-1]:.3f}, y={grid.ys[-1,-1]:.3f}")
+    
+    os.makedirs(args.debug_dir, exist_ok=True)
+
+    info("=== Step 4: Per-camera remap + BEV projection debug ===")
+
+    for ch in CAM_CHANNELS_6:
+        cf = selection.cameras[ch]
+        c = calibs[ch]
+
+        img = cv2.imread(cf.filename_abs, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"cv2 could not read: {cf.filename_abs}")
+        img_h, img_w = img.shape[:2]
+
+        map_u, map_v, valid = project_ego_grid_to_image_maps(
+            pts_ego=grid.pts_ego,
+            T_cam_from_ego=c.T_cam_from_ego,
+            K=c.K,
+            img_w=img_w,
+            img_h=img_h,
+        )
+
+        bev = cv2.remap(img, map_u, map_v, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+        # Apply mask (set invalid to black)
+        bev[~valid] = 0
+
+        out_path = os.path.join(args.debug_dir, f"{ch}_bev.png")
+        cv2.imwrite(out_path, bev)
+
+        valid_ratio = float(valid.mean())
+        info(f"{ch}: saved {out_path} | valid ratio={valid_ratio:.3f}")
 
 
 if __name__ == "__main__":
