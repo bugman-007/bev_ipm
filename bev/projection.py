@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Optional
 import numpy as np
 import cv2
 
@@ -34,16 +34,18 @@ def project_ego_points_to_image(
     ones = np.ones((pts.shape[0], 1), dtype=np.float32)
     pts_h = np.concatenate([pts, ones], axis=1)  # (N,4)
     pts_cam_h = (T_cam_from_ego.astype(np.float32) @ pts_h.T).T  # (N,4)
+
     X = pts_cam_h[:, 0]
     Y = pts_cam_h[:, 1]
     Z = pts_cam_h[:, 2]
 
+    # Pinhole projection assumes camera coords are OpenCV-like:
+    # x right, y down, z forward.
     valid = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z) & (Z > float(min_depth))
 
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
-    # OpenCV camera convention: x right, y down, z forward
     u = fx * (X / (Z + 1e-12)) + cx
     v = fy * (Y / (Z + 1e-12)) + cy
 
@@ -60,22 +62,45 @@ def warp_image_to_bev(
     T_cam_from_ego: np.ndarray,
     z_plane: float = 0.0,
     interpolation: int = cv2.INTER_LINEAR,
+    # --- NEW: ROI gating to reduce IPM pinwheel artifacts ---
+    roi_vmin: Optional[float] = None,
+    roi_vmax: Optional[float] = None,
+    roi_umin: Optional[float] = None,
+    roi_umax: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Inverse-perspective mapping (IPM): for each BEV cell center, sample the
     corresponding camera pixel (u,v) and remap.
 
+    NEW: Optional ROI gating in the SOURCE image (u/v) to reduce radial stretching.
+         This is a pragmatic Phase-1 fix for planar IPM: we ignore pixels near the
+         horizon/upper image which tend to be non-ground / far-range and cause
+         strong "pinwheel" smearing.
+
     Returns:
       warped_bgr: (H,W,3) uint8
-      valid_mask: (H,W) bool (u/v inside image AND depth positive)
+      valid_mask: (H,W) bool (u/v inside image AND depth positive AND inside ROI)
     """
     pts_ego = grid.ego_points(z=z_plane)  # (H,W,3)
     u, v, valid = project_ego_points_to_image(pts_ego, K, T_cam_from_ego)  # (H,W)
+
     u_map = u.astype(np.float32)
     v_map = v.astype(np.float32)
 
     ih, iw = img_bgr.shape[:2]
+
     inside = (u_map >= 0.0) & (u_map <= (iw - 1)) & (v_map >= 0.0) & (v_map <= (ih - 1))
+
+    # ROI gating (in pixel coordinates)
+    if roi_vmin is not None:
+        inside &= (v_map >= float(roi_vmin))
+    if roi_vmax is not None:
+        inside &= (v_map <= float(roi_vmax))
+    if roi_umin is not None:
+        inside &= (u_map >= float(roi_umin))
+    if roi_umax is not None:
+        inside &= (u_map <= float(roi_umax))
+
     valid_mask = valid & inside
 
     warped = cv2.remap(
