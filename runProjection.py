@@ -6,6 +6,9 @@ from typing import Optional
 from bev.nuscenes_io import init_nuscenes, select_sample, CAM_CHANNELS_6
 from bev.utils import info
 
+import numpy as np
+from bev.nuscenes_io import get_camera_calibration_for_sample
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -55,6 +58,20 @@ def main() -> None:
         info("")
 
     info("Step 1 complete: all 6 camera images resolved.")
+
+    calibs = get_camera_calibration_for_sample(nusc, selection)
+
+info("=== Step 2: Calibration & ego pose matrices ===")
+for ch in CAM_CHANNELS_6:
+    c = calibs[ch]
+    info(f"{ch}:")
+    info("  K (intrinsics):")
+    info(str(np.array2string(c.K, precision=3, suppress_small=True)))
+    info("  T_cam_from_ego (ego -> cam):")
+    info(str(np.array2string(c.T_cam_from_ego, precision=3, suppress_small=True)))
+    info("  T_ego_from_cam (cam -> ego):")
+    info(str(np.array2string(c.T_ego_from_cam, precision=3, suppress_small=True)))
+    info("")
 
 
 if __name__ == "__main__":

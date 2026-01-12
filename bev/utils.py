@@ -1,13 +1,21 @@
-from __future__ import annotations
-import os
+import numpy as np
+from pyquaternion import Quaternion
 
-def assert_file_exists(path: str, what: str = "file") -> None:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Missing {what}: {path}")
+def quat_to_rotmat(qwqxqyqz) -> np.ndarray:
+    # nuScenes stores rotation as [w, x, y, z]
+    q = Quaternion(qwqxqyqz)
+    return q.rotation_matrix.astype(np.float64)
 
-def assert_dir_exists(path: str, what: str = "directory") -> None:
-    if not os.path.isdir(path):
-        raise NotADirectoryError(f"Missing {what}: {path}")
+def make_se3(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t.reshape(3)
+    return T
 
-def info(msg: str) -> None:
-    print(msg, flush=True)
+def invert_se3(T: np.ndarray) -> np.ndarray:
+    R = T[:3, :3]
+    t = T[:3, 3]
+    Ti = np.eye(4, dtype=np.float64)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+    return Ti
