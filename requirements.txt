@@ -1,0 +1,5 @@
+nuscenes-devkit>=1.1.10
+numpy>=1.21
+opencv-python>=4.7
+Pillow>=9.0
+pyquaternion>=0.9.9
