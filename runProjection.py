@@ -1,16 +1,22 @@
-from __future__ import annotations
+# runProjection.py  (TOP OF FILE - replace from line 1 down through the imports)
+import os
+import sys
+
+# Ensure imports work no matter where you run this script from (Windows/Linux/EC2).
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
 
 import argparse
-import os
-from typing import Dict, List
-
+import numpy as np
 import cv2
-from nuscenes.nuscenes import NuScenes
 
 from bev_grid import BEVGrid
-from nuscenes_io import get_camera_calibration_for_sample
-from projection import warp_image_to_bev
-from stitching import stitch_warped, wsum_to_vis
+from nuscenes_io import init_nuscenes, get_scene_sample, get_camera_sample_data, get_camera_calibrations
+from projection import project_points_ego_to_image, sample_image_bilinear
+from stitching import stitch_bev_images
+from utils import ensure_parent_dir
+
 
 
 CAMERAS: List[str] = [
