@@ -8,6 +8,7 @@ from bev.utils import info
 
 import numpy as np
 from bev.nuscenes_io import get_camera_calibration_for_sample
+from bev.bev_grid import make_bev_grid
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_token", type=str, default=None, help="Select a specific sample token")
     p.add_argument("--scene", type=str, default=None, help="Scene token or scene name like scene-0061")
     p.add_argument("--index", type=int, default=0, help="Sample index inside scene (0-based)")
+    p.add_argument("--x_min", type=float, default=0.0)
+    p.add_argument("--x_max", type=float, default=60.0)
+    p.add_argument("--y_min", type=float, default=-30.0)
+    p.add_argument("--y_max", type=float, default=30.0)
+    p.add_argument("--res", type=float, default=0.05, help="meters per pixel")
 
     # output placeholder (used in later steps; kept for interface stability)
     p.add_argument("--out", type=str, default="output.png", help="Output image path (used in later steps)")
@@ -72,6 +78,16 @@ def main() -> None:
         info("  T_ego_from_cam (cam -> ego):")
         info(str(np.array2string(c.T_ego_from_cam, precision=3, suppress_small=True)))
         info("")
+        
+    grid = make_bev_grid(args.x_min, args.x_max, args.y_min, args.y_max, args.res)
+
+    info("=== Step 3: BEV grid ===")
+    info(f"Bounds: x[{grid.x_min}, {grid.x_max}] y[{grid.y_min}, {grid.y_max}] res={grid.res} m/px")
+    info(f"Canvas: H={grid.H} W={grid.W}")
+
+    # Print a few sanity points (meters)
+    info(f"Top-left ego point (approx): x={grid.xs[0,0]:.3f}, y={grid.ys[0,0]:.3f}")
+    info(f"Bottom-right ego point (approx): x={grid.xs[-1,-1]:.3f}, y={grid.ys[-1,-1]:.3f}")
 
 
 if __name__ == "__main__":
