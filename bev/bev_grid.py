@@ -1,45 +1,58 @@
 from __future__ import annotations
-import numpy as np
-from dataclasses import dataclass
 
-@dataclass
+from dataclasses import dataclass
+import numpy as np
+
+
+@dataclass(frozen=True)
 class BEVGrid:
+    """
+    BEV grid definition in the nuScenes ego frame:
+      - Ego: x forward, y left, z up (meters).
+      - Image: rows increase downward, cols increase rightward.
+
+    By default we choose a visualization-friendly convention:
+      - Forward (x+) is UP in the BEV image  -> flip_x=True
+      - Left (y+) is LEFT in the BEV image   -> flip_y=True
+
+    This matches most BEV viewers (top = forward, left = left).
+    Set flip_x/flip_y to False to keep the raw increasing order.
+    """
     x_min: float
     x_max: float
     y_min: float
     y_max: float
     res: float
-    H: int
-    W: int
-    xs: np.ndarray      # (H, W) ego-x in meters
-    ys: np.ndarray      # (H, W) ego-y in meters
-    pts_ego: np.ndarray # (H, W, 3) (x,y,0)
+    flip_x: bool = True
+    flip_y: bool = True
 
-def make_bev_grid(
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-    res: float
-) -> BEVGrid:
-    if res <= 0:
-        raise ValueError("res must be > 0")
-    if x_max <= x_min or y_max <= y_min:
-        raise ValueError("Invalid bounds")
+    @property
+    def H(self) -> int:
+        return int(np.ceil((self.x_max - self.x_min) / self.res))
 
-    # H corresponds to x (forward), W corresponds to y (left/right)
-    H = int(np.ceil((x_max - x_min) / res))
-    W = int(np.ceil((y_max - y_min) / res))
+    @property
+    def W(self) -> int:
+        return int(np.ceil((self.y_max - self.y_min) / self.res))
 
-    # Pixel centers: x increases down the image (rows), y increases right (cols)
-    x_coords = x_min + (np.arange(H) + 0.5) * res
-    y_coords = y_min + (np.arange(W) + 0.5) * res
+    def x_coords(self) -> np.ndarray:
+        # cell centers
+        xs = self.x_min + (np.arange(self.H, dtype=np.float32) + 0.5) * self.res
+        if self.flip_x:
+            xs = xs[::-1].copy()
+        return xs
 
-    xs, ys = np.meshgrid(x_coords, y_coords, indexing="ij")  # (H,W)
+    def y_coords(self) -> np.ndarray:
+        ys = self.y_min + (np.arange(self.W, dtype=np.float32) + 0.5) * self.res
+        if self.flip_y:
+            ys = ys[::-1].copy()
+        return ys
 
-    pts_ego = np.stack([xs, ys, np.zeros_like(xs)], axis=-1).astype(np.float64)  # (H,W,3)
-
-    return BEVGrid(
-        x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, res=res,
-        H=H, W=W, xs=xs, ys=ys, pts_ego=pts_ego
-    )
+    def ego_points(self, z: float = 0.0) -> np.ndarray:
+        """
+        Returns (H, W, 3) float32 array of ego-frame points lying on plane z.
+        """
+        xs = self.x_coords()
+        ys = self.y_coords()
+        X, Y = np.meshgrid(xs, ys, indexing="ij")  # (H, W)
+        Z = np.full_like(X, float(z), dtype=np.float32)
+        return np.stack([X, Y, Z], axis=-1).astype(np.float32)

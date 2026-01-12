@@ -2,178 +2,142 @@ from __future__ import annotations
 
 import argparse
 import os
-from datetime import datetime
+from typing import Dict, List
 
 import cv2
-import numpy as np
+from nuscenes.nuscenes import NuScenes
 
-from bev.bev_grid import make_bev_grid
-from bev.nuscenes_io import (
-    CAM_CHANNELS_6,
-    get_camera_calibration_for_sample,
-    init_nuscenes,
-    select_sample,
-)
-from bev.projection import project_ego_grid_to_image_maps
-from bev.stitching import blend_bev, feather_weight
-from bev.utils import info
+from bev_grid import BEVGrid
+from nuscenes_io import get_camera_calibration_for_sample
+from projection import warp_image_to_bev
+from stitching import stitch_warped, wsum_to_vis
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Phase-1 BEV RGB projection prototype (Step 1: select sample + list 6 camera frames)."
-    )
-    p.add_argument("--dataroot", type=str, required=True, help="Path to nuScenes dataset root")
-    p.add_argument("--version", type=str, required=True, help="nuScenes version, e.g. v1.0-mini or v1.0-trainval")
-
-    # selection
-    p.add_argument("--sample_token", type=str, default=None, help="Select a specific sample token")
-    p.add_argument("--scene", type=str, default=None, help="Scene token or scene name like scene-0061")
-    p.add_argument("--index", type=int, default=0, help="Sample index inside scene (0-based)")
-    p.add_argument("--x_min", type=float, default=0.0)
-    p.add_argument("--x_max", type=float, default=60.0)
-    p.add_argument("--y_min", type=float, default=-30.0)
-    p.add_argument("--y_max", type=float, default=30.0)
-    p.add_argument("--res", type=float, default=0.05, help="meters per pixel")
-    p.add_argument("--quiet", action="store_true", help="Less verbose nuScenes init")
-    p.add_argument("--debug_dir", type=str, default="debug", help="Where to save per-camera debug BEV images")
-    p.add_argument("--out", type=str, default="output_bev.png")
-    p.add_argument("--feather", type=int, default=51, help="Gaussian kernel for blending weights (odd integer)")
-    p.add_argument("--save_wsum", action="store_true", help="Save weight-sum visualization")
-
-    # Step-6 (still Phase-1): suppress far/horizon stretching
-    p.add_argument("--tau", type=float, default=20.0, help="Distance falloff (meters). Smaller = less far-field smear")
-
-    # Optional display convention: make +x (forward) point upward in the output image
-    p.add_argument("--flipud", action="store_true", help="Flip output vertically so forward (+x) is up")
-
-    # Avoid mixing outputs across runs
-    p.add_argument("--auto_debug_dir", action="store_true", help="Append run info to debug_dir (recommended)")
+CAMERAS: List[str] = [
+    "CAM_FRONT",
+    "CAM_FRONT_RIGHT",
+    "CAM_BACK_RIGHT",
+    "CAM_BACK",
+    "CAM_BACK_LEFT",
+    "CAM_FRONT_LEFT",
+]
 
 
-    return p.parse_args()
+def _find_scene_by_name(nusc: NuScenes, scene_name: str) -> Dict:
+    for scene in nusc.scene:
+        if scene["name"] == scene_name:
+            return scene
+    raise ValueError(f"Scene '{scene_name}' not found in {nusc.version}.")
+
+
+def _sample_token_at_index(nusc: NuScenes, scene_rec: Dict, index: int) -> str:
+    token = scene_rec["first_sample_token"]
+    for _ in range(int(index)):
+        sample = nusc.get("sample", token)
+        nxt = sample["next"]
+        if nxt == "":
+            raise IndexError(f"Scene ended before index={index}.")
+        token = nxt
+    return token
+
+
+def _ensure_dir(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
 
 
 def main() -> None:
-    args = parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataroot", required=True)
+    p.add_argument("--version", default="v1.0-mini")
+    p.add_argument("--scene", required=True, help="e.g. scene-0061")
+    p.add_argument("--index", type=int, default=0, help="sample index within the scene")
+    p.add_argument("--x_min", type=float, default=-30.0)
+    p.add_argument("--x_max", type=float, default=60.0)
+    p.add_argument("--y_min", type=float, default=-30.0)
+    p.add_argument("--y_max", type=float, default=30.0)
+    p.add_argument("--res", type=float, default=0.05)
+    p.add_argument("--out", default="stitched_bev.png")
+    p.add_argument("--out_dir", default="", help="If set, saves all outputs there.")
+    p.add_argument("--feather_px", type=int, default=80)
+    p.add_argument("--save_per_camera", action="store_true")
+    p.add_argument("--save_wsum", action="store_true")
+    p.add_argument("--fill_holes", action="store_true", help="Visual-only: inpaint wsum==0 pixels.")
+    p.add_argument("--inpaint_radius", type=int, default=5)
+    p.add_argument("--no_flip_axes", action="store_true", help="Keep legacy axes (x down, y right).")
+    p.add_argument("--quiet", action="store_true")
+    args = p.parse_args()
 
-    nusc = init_nuscenes(args.dataroot, args.version, verbose=(not args.quiet))
+    dataroot = os.path.normpath(args.dataroot)
+    nusc = NuScenes(version=args.version, dataroot=dataroot, verbose=not args.quiet)
 
-    selection = select_sample(
-        nusc,
-        sample_token=args.sample_token,
-        scene=args.scene,
-        index=args.index,
+    scene_rec = _find_scene_by_name(nusc, args.scene)
+    sample_token = _sample_token_at_index(nusc, scene_rec, args.index)
+    sample = nusc.get("sample", sample_token)
+
+    grid = BEVGrid(
+        x_min=args.x_min,
+        x_max=args.x_max,
+        y_min=args.y_min,
+        y_max=args.y_max,
+        res=args.res,
+        flip_x=not args.no_flip_axes,
+        flip_y=not args.no_flip_axes,
+    )
+    
+    if not args.quiet:
+        print("=== BEV grid ===")
+        print(f"Bounds: x[{args.x_min}, {args.x_max}] y[{args.y_min}, {args.y_max}] res={args.res} m/px")
+        print(f"Canvas: H={grid.H} W={grid.W}")
+        print(f"flip_axes: {'NO' if args.no_flip_axes else 'YES'} (forward is {'down' if args.no_flip_axes else 'up'})")
+        print(f"Top-left ego point (approx): x={grid.X[0,0]:.3f}, y={grid.Y[0,0]:.3f}")
+        print(f"Bottom-right ego point (approx): x={grid.X[-1,-1]:.3f}, y={grid.Y[-1,-1]:.3f}")
+
+
+    cam_sd_tokens: Dict[str, str] = {cam: sample["data"][cam] for cam in CAMERAS if cam in sample["data"]}
+    if not cam_sd_tokens:
+        raise RuntimeError("No camera sample_data tokens found for this sample.")
+
+    calibs = get_camera_calibration_for_sample(nusc, cam_sd_tokens)
+
+    warped_by_cam: Dict[str, any] = {}
+    valid_by_cam: Dict[str, any] = {}
+
+    out_dir = args.out_dir or os.path.dirname(args.out)
+    _ensure_dir(out_dir)
+    out_path = os.path.join(out_dir, os.path.basename(args.out)) if out_dir else args.out
+
+    for cam, sd_token in cam_sd_tokens.items():
+        data_path, _, _ = nusc.get_sample_data(sd_token)
+        img = cv2.imread(data_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"Failed to read image: {data_path}")
+
+        calib = calibs[cam]
+        warped, valid = warp_image_to_bev(img, grid, calib.K, calib.T_cam_from_ego)
+
+        warped_by_cam[cam] = warped
+        valid_by_cam[cam] = valid
+
+        if args.save_per_camera:
+            cv2.imwrite(os.path.join(out_dir, f"{cam}_bev.png"), warped)
+
+    stitched, wsum = stitch_warped(
+        warped_by_cam,
+        valid_by_cam,
+        feather_px=args.feather_px,
+        fill_holes=args.fill_holes,
+        inpaint_radius=args.inpaint_radius,
     )
 
-    info("=== Step 1: Sample selection + 6 camera frames ===")
-    info(f"Scene: {selection.scene_name}")
-    info(f"Scene token: {selection.scene_token}")
-    info(f"Sample token: {selection.sample_token}")
-    info(f"Sample timestamp (us): {selection.timestamp}")
-    info("")
-
-    for ch in CAM_CHANNELS_6:
-        cf = selection.cameras[ch]
-        info(f"{ch}:")
-        info(f"  sample_data_token: {cf.sample_data_token}")
-        info(f"  timestamp (us):    {cf.timestamp}")
-        info(f"  image:             {cf.filename_abs}")
-        info(f"  size:              {cf.width} x {cf.height}")
-        info("")
-
-    info("Step 1 complete: all 6 camera images resolved.")
-
-    calibs = get_camera_calibration_for_sample(nusc, selection)
-
-    info("=== Step 2: Calibration & ego pose matrices ===")
-    for ch in CAM_CHANNELS_6:
-        c = calibs[ch]
-        info(f"{ch}:")
-        info("  K (intrinsics):")
-        info(str(np.array2string(c.K, precision=3, suppress_small=True)))
-        info("  T_cam_from_ego (ego -> cam):")
-        info(str(np.array2string(c.T_cam_from_ego, precision=3, suppress_small=True)))
-        info("  T_ego_from_cam (cam -> ego):")
-        info(str(np.array2string(c.T_ego_from_cam, precision=3, suppress_small=True)))
-        info("")
-        
-    grid = make_bev_grid(args.x_min, args.x_max, args.y_min, args.y_max, args.res)
-
-    info("=== Step 3: BEV grid ===")
-    info(f"Bounds: x[{grid.x_min}, {grid.x_max}] y[{grid.y_min}, {grid.y_max}] res={grid.res} m/px")
-    info(f"Canvas: H={grid.H} W={grid.W}")
-
-    # Print a few sanity points (meters)
-    info(f"Top-left ego point (approx): x={grid.xs[0,0]:.3f}, y={grid.ys[0,0]:.3f}")
-    info(f"Bottom-right ego point (approx): x={grid.xs[-1,-1]:.3f}, y={grid.ys[-1,-1]:.3f}")
-    
-    # Make debug dir unique per run to avoid mixing outputs across different bounds/res
-    debug_dir = args.debug_dir
-    if args.auto_debug_dir:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tag = f"{args.scene}_idx{args.index}_x{args.x_min}_{args.x_max}_y{args.y_min}_{args.y_max}_res{args.res}_{stamp}"
-        debug_dir = os.path.join(debug_dir, tag)
-
-    os.makedirs(debug_dir, exist_ok=True)
-
-    info("=== Step 4: Per-camera remap + BEV projection debug ===")
-    # Precompute BEV distance (meters) for falloff weighting (reduces far/horizon smear)
-    dist = np.sqrt(grid.xs**2 + grid.ys**2).astype(np.float32)
-    falloff = np.exp(-dist / float(args.tau)).astype(np.float32)
-
-    images = []
-    weights = []
-
-    for ch in CAM_CHANNELS_6:
-        cf = selection.cameras[ch]
-        c = calibs[ch]
-
-        img = cv2.imread(cf.filename_abs, cv2.IMREAD_COLOR)
-        if img is None:
-            raise RuntimeError(f"cv2 could not read: {cf.filename_abs}")
-        img_h, img_w = img.shape[:2]
-
-        map_u, map_v, valid = project_ego_grid_to_image_maps(
-            pts_ego=grid.pts_ego,
-            T_cam_from_ego=c.T_cam_from_ego,
-            K=c.K,
-            img_w=img_w,
-            img_h=img_h,
-        )
-
-        bev = cv2.remap(img, map_u, map_v, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-        bev[~valid] = 0
-
-        # Debug per-camera
-        out_path = os.path.join(debug_dir, f"{ch}_bev.png")
-        cv2.imwrite(out_path, bev)
-        info(f"{ch}: saved {out_path} | valid ratio={float(valid.mean()):.3f}")
-
-        # Feather weight for blending
-        w = feather_weight(valid, ksize=args.feather)
-        w *= falloff
-
-        images.append(bev)
-        weights.append(w)
-
-    # Blend
-    final_bev = blend_bev(images, weights)
-
-    if args.flipud:
-        final_bev = np.flipud(final_bev)
-
-    cv2.imwrite(args.out, final_bev)
-    info(f"Saved stitched BEV: {args.out}")
-
+    cv2.imwrite(out_path, stitched)
 
     if args.save_wsum:
-        wsum = np.clip(np.sum(np.stack(weights, axis=0), axis=0), 0, 1)
-        wsum_vis = (wsum * 255).astype(np.uint8)
-        if args.flipud:
-            wsum_vis = np.flipud(wsum_vis)
-        cv2.imwrite(os.path.join(debug_dir, "wsum.png"), wsum_vis)
+        cv2.imwrite(os.path.join(out_dir, "wsum.png"), wsum_to_vis(wsum))
 
+    print(f"Saved stitched BEV: {out_path}")
+    if args.save_wsum:
+        print(f"Saved wsum: {os.path.join(out_dir, 'wsum.png')}")
 
 
 if __name__ == "__main__":

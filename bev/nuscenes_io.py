@@ -7,14 +7,24 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 from nuscenes.nuscenes import NuScenes
 from PIL import Image
+from typing import Union, Mapping 
 
-from .utils import (
-    assert_dir_exists,
-    assert_file_exists,
-    quat_to_rotmat,
-    make_se3,
-    invert_se3,
-)
+try:
+    from utils import (
+        quat_to_rotmat,
+        make_se3,
+        invert_se3,
+        assert_dir_exists,
+        assert_file_exists,
+    )
+except ImportError:
+    from .utils import (
+        quat_to_rotmat,
+        make_se3,
+        invert_se3,
+        assert_dir_exists,
+        assert_file_exists,
+    )
 
 CAM_CHANNELS_6 = [
     "CAM_FRONT",
@@ -157,35 +167,53 @@ class CameraCalibration:
 
 
 def get_camera_calibration_for_sample(
-    nusc: NuScenes,
-    selection: SampleSelection
+    nusc: "NuScenes",
+    selection_or_sd_tokens: Union[SampleSelection, Mapping[str, str]],
 ) -> Dict[str, CameraCalibration]:
-    out: Dict[str, CameraCalibration] = {}
+    """
+    Returns per-camera calibration for a sample.
 
-    for ch, cam in selection.cameras.items():
-        sd = nusc.get("sample_data", cam.sample_data_token)
+    Accepts either:
+      1) SampleSelection (preferred; has .cameras mapping), OR
+      2) dict-like mapping: {channel_name: sample_data_token}
+         (this is what runProjection.py currently passes)
+    """
+    calibs: Dict[str, CameraCalibration] = {}
 
+    # Normalize input into an iterator of (channel, sample_data_token, image_path_or_none)
+    if isinstance(selection_or_sd_tokens, SampleSelection):
+        items = [
+            (ch, cam.sample_data_token, cam.image_path)
+            for ch, cam in selection_or_sd_tokens.cameras.items()
+        ]
+    else:
+        items = [(ch, sd_token, None) for ch, sd_token in selection_or_sd_tokens.items()]
+
+    for ch, sd_token, maybe_img_path in items:
+        sd = nusc.get("sample_data", sd_token)
         cs = nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
-        K = np.array(cs["camera_intrinsic"], dtype=np.float64)
 
+        # In nuScenes, calibrated_sensor rotation/translation represent the sensor pose in ego frame,
+        # i.e. they transform points from sensor(frame) -> ego(frame).
         R_ego_from_cam = quat_to_rotmat(cs["rotation"])
         t_ego_from_cam = np.array(cs["translation"], dtype=np.float64)
         T_ego_from_cam = make_se3(R_ego_from_cam, t_ego_from_cam)
         T_cam_from_ego = invert_se3(T_ego_from_cam)
 
-        ep = nusc.get("ego_pose", sd["ego_pose_token"])
-        R_global_from_ego = quat_to_rotmat(ep["rotation"])
-        t_global_from_ego = np.array(ep["translation"], dtype=np.float64)
-        T_global_from_ego = make_se3(R_global_from_ego, t_global_from_ego)
-        T_ego_from_global = invert_se3(T_global_from_ego)
+        K = np.array(cs["camera_intrinsic"], dtype=np.float64)
 
-        out[ch] = CameraCalibration(
+        if maybe_img_path is not None:
+            image_path = maybe_img_path
+        else:
+            image_path = os.path.join(nusc.dataroot, sd["filename"])
+
+        calibs[ch] = CameraCalibration(
             channel=ch,
+            sample_data_token=sd_token,
+            image_path=image_path,
             K=K,
             T_ego_from_cam=T_ego_from_cam,
             T_cam_from_ego=T_cam_from_ego,
-            T_global_from_ego=T_global_from_ego,
-            T_ego_from_global=T_ego_from_global,
         )
 
-    return out
+    return calibs
