@@ -162,8 +162,6 @@ class CameraCalibration:
     K: np.ndarray                 # 3x3
     T_ego_from_cam: np.ndarray    # 4x4  (cam -> ego)
     T_cam_from_ego: np.ndarray    # 4x4  (ego -> cam)
-    T_global_from_ego: np.ndarray # 4x4
-    T_ego_from_global: np.ndarray # 4x4
 
 
 def get_camera_calibration_for_sample(
@@ -180,16 +178,16 @@ def get_camera_calibration_for_sample(
     """
     calibs: Dict[str, CameraCalibration] = {}
 
-    # Normalize input into an iterator of (channel, sample_data_token, image_path_or_none)
+    # Normalize input into an iterator of (channel, sample_data_token)
     if isinstance(selection_or_sd_tokens, SampleSelection):
         items = [
-            (ch, cam.sample_data_token, cam.image_path)
+            (ch, cam.sample_data_token)
             for ch, cam in selection_or_sd_tokens.cameras.items()
         ]
     else:
-        items = [(ch, sd_token, None) for ch, sd_token in selection_or_sd_tokens.items()]
+        items = [(ch, sd_token) for ch, sd_token in selection_or_sd_tokens.items()]
 
-    for ch, sd_token, maybe_img_path in items:
+    for ch, sd_token in items:
         sd = nusc.get("sample_data", sd_token)
         cs = nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
 
@@ -202,15 +200,8 @@ def get_camera_calibration_for_sample(
 
         K = np.array(cs["camera_intrinsic"], dtype=np.float64)
 
-        if maybe_img_path is not None:
-            image_path = maybe_img_path
-        else:
-            image_path = os.path.join(nusc.dataroot, sd["filename"])
-
         calibs[ch] = CameraCalibration(
             channel=ch,
-            sample_data_token=sd_token,
-            image_path=image_path,
             K=K,
             T_ego_from_cam=T_ego_from_cam,
             T_cam_from_ego=T_cam_from_ego,

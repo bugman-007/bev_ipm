@@ -1,23 +1,37 @@
-# runProjection.py  (TOP OF FILE - replace from line 1 down through the imports)
+# runProjection.py  (TOP OF FILE — replace everything from line 1 down through all the imports)
+
+from __future__ import annotations
+
 import os
 import sys
 
-# Ensure imports work no matter where you run this script from (Windows/Linux/EC2).
+# --- Robust import path setup (fixes ModuleNotFoundError on Windows/EC2) ---
+# Ensure Python can import modules that live either:
+#   1) next to runProjection.py   (./bev_grid.py)
+#   2) inside a subfolder         (./bev/bev_grid.py)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Always allow importing from the script directory
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+# Also allow importing from ./bev even if it's not a Python package (no __init__.py)
+_BEV_DIR = os.path.join(_THIS_DIR, "bev")
+if os.path.isdir(_BEV_DIR) and _BEV_DIR not in sys.path:
+    sys.path.insert(0, _BEV_DIR)
+
 import argparse
+from typing import Optional, List, Dict
+
 import numpy as np
 import cv2
+from nuscenes.nuscenes import NuScenes
 
+# Prefer local modules; if they are inside ./bev, the sys.path tweak above covers it.
 from bev_grid import BEVGrid
-from nuscenes_io import init_nuscenes, get_scene_sample, get_camera_sample_data, get_camera_calibrations
-from projection import project_points_ego_to_image, sample_image_bilinear
-from stitching import stitch_bev_images
-from utils import ensure_parent_dir
-
-
+from nuscenes_io import init_nuscenes, get_camera_calibration_for_sample
+from projection import warp_image_to_bev
+from stitching import stitch_warped, wsum_to_vis
 
 CAMERAS: List[str] = [
     "CAM_FRONT",
@@ -96,8 +110,9 @@ def main() -> None:
         print(f"Bounds: x[{args.x_min}, {args.x_max}] y[{args.y_min}, {args.y_max}] res={args.res} m/px")
         print(f"Canvas: H={grid.H} W={grid.W}")
         print(f"flip_axes: {'NO' if args.no_flip_axes else 'YES'} (forward is {'down' if args.no_flip_axes else 'up'})")
-        print(f"Top-left ego point (approx): x={grid.X[0,0]:.3f}, y={grid.Y[0,0]:.3f}")
-        print(f"Bottom-right ego point (approx): x={grid.X[-1,-1]:.3f}, y={grid.Y[-1,-1]:.3f}")
+        pts = grid.ego_points(z=0.0)
+        print(f"Top-left ego point (approx): x={pts[0,0,0]:.3f}, y={pts[0,0,1]:.3f}")
+        print(f"Bottom-right ego point (approx): x={pts[-1,-1,0]:.3f}, y={pts[-1,-1,1]:.3f}")
 
 
     cam_sd_tokens: Dict[str, str] = {cam: sample["data"][cam] for cam in CAMERAS if cam in sample["data"]}
