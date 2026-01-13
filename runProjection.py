@@ -30,8 +30,8 @@ from nuscenes.nuscenes import NuScenes
 # Prefer local modules; if they are inside ./bev, the sys.path tweak above covers it.
 from bev_grid import BEVGrid
 from nuscenes_io import init_nuscenes, get_camera_calibration_for_sample
-from projection import warp_image_to_bev
 from stitching import stitch_warped, wsum_to_vis
+from projection import splat_image_to_bev_ground
 
 CAMERAS: List[str] = [
     "CAM_FRONT",
@@ -135,10 +135,10 @@ def main() -> None:
             raise FileNotFoundError(f"Failed to read image: {data_path}")
 
         calib = calibs[cam]
-        warped, valid = warp_image_to_bev(img, grid, calib.K, calib.T_cam_from_ego)
+        warped, wsum = splat_image_to_bev_ground(img, grid, calib.K, calib.T_ego_from_cam, z_plane=0.0, stride=2)
 
         warped_by_cam[cam] = warped
-        valid_by_cam[cam] = valid
+        valid_by_cam[cam] = (wsum > 1e-6)
 
         if args.save_per_camera:
             cv2.imwrite(os.path.join(out_dir, f"{cam}_bev.png"), warped)

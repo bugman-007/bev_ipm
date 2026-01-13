@@ -56,3 +56,20 @@ class BEVGrid:
         X, Y = np.meshgrid(xs, ys, indexing="ij")  # (H, W)
         Z = np.full_like(X, float(z), dtype=np.float32)
         return np.stack([X, Y, Z], axis=-1).astype(np.float32)
+    
+    def ego_xy_to_ij(self, X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Convert ego-frame X (forward), Y (left) into BEV image indices (i,j).
+        i corresponds to x axis, j corresponds to y axis.
+        Applies flip_x/flip_y consistently with ego_points().
+        """
+        # continuous index in non-flipped coordinates
+        i = (X - self.x_min) / self.res - 0.5
+        j = (Y - self.y_min) / self.res - 0.5
+
+        if self.flip_x:
+            i = (self.H - 1) - i
+        if self.flip_y:
+            j = (self.W - 1) - j
+
+        return i, j

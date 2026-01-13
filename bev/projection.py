@@ -55,6 +55,109 @@ def project_ego_points_to_image(
     return u, v, valid
 
 
+def splat_image_to_bev_ground(
+    img_bgr: np.ndarray,
+    grid: BEVGrid,
+    K: np.ndarray,
+    T_ego_from_cam: np.ndarray,   # cam -> ego
+    z_plane: float = 0.0,
+    stride: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    ih, iw = img_bgr.shape[:2]
+    K = K.astype(np.float64)
+    Kinv = np.linalg.inv(K)
+
+    # pixel grid (centers)
+    us = (np.arange(0, iw, stride, dtype=np.float64) + 0.5)
+    vs = (np.arange(0, ih, stride, dtype=np.float64) + 0.5)
+    U, V = np.meshgrid(us, vs)  # (h', w')
+    h2, w2 = U.shape
+    N = h2 * w2
+
+    pix = np.stack([U, V, np.ones_like(U)], axis=-1).reshape(-1, 3).T  # (3, N)
+
+    # rays in cam
+    d_cam = Kinv @ pix  # (3, N)
+
+    # cam->ego
+    R = T_ego_from_cam[:3, :3].astype(np.float64)
+    t = T_ego_from_cam[:3, 3].astype(np.float64)  # (3,)
+    d_ego = R @ d_cam  # (3, N)
+
+    # ray-plane intersection: p = t + s*d, with p_z = z_plane
+    denom = d_ego[2, :]  # (N,)
+    valid = np.abs(denom) > 1e-9
+
+    s = np.zeros((N,), dtype=np.float64)
+    s[valid] = (float(z_plane) - t[2]) / denom[valid]
+
+    # require intersection in front of camera
+    valid &= (s > 1e-6)
+
+    # intersection points in ego
+    X = t[0] + d_ego[0, :] * s
+    Y = t[1] + d_ego[1, :] * s
+
+    # map to BEV indices (float)
+    ii, jj = grid.ego_xy_to_ij(X, Y)
+
+    # inside BEV (leave 1px margin for bilinear +1)
+    valid &= (ii >= 0) & (ii < grid.H - 1) & (jj >= 0) & (jj < grid.W - 1)
+
+    if not np.any(valid):
+        return np.zeros((grid.H, grid.W, 3), dtype=np.uint8), np.zeros((grid.H, grid.W), dtype=np.float32)
+
+    # bilinear weights
+    i0 = np.floor(ii).astype(np.int32)
+    j0 = np.floor(jj).astype(np.int32)
+    di = (ii - i0).astype(np.float32)
+    dj = (jj - j0).astype(np.float32)
+
+    w00 = (1 - di) * (1 - dj)
+    w10 = di * (1 - dj)
+    w01 = (1 - di) * dj
+    w11 = di * dj
+
+    # sample colors from strided pixel positions matching pix flatten order
+    idx = np.arange(N, dtype=np.int64)
+    u_idx = (idx % w2)
+    v_idx = (idx // w2)
+    u_px = (u_idx * stride).astype(np.int32)
+    v_px = (v_idx * stride).astype(np.int32)
+    cols = img_bgr[v_px, u_px].astype(np.float32)  # (N,3)
+
+    # apply mask once
+    vmask = valid
+    i0m = i0[vmask]
+    j0m = j0[vmask]
+    cols_m = cols[vmask]
+
+    w00m = w00[vmask]
+    w10m = w10[vmask]
+    w01m = w01[vmask]
+    w11m = w11[vmask]
+
+    acc = np.zeros((grid.H, grid.W, 3), dtype=np.float32)
+    wsum = np.zeros((grid.H, grid.W), dtype=np.float32)
+
+    def add(i, j, w):
+        # accumulate per-channel safely with np.add.at
+        np.add.at(wsum, (i, j), w)
+        for c in range(3):
+            np.add.at(acc[..., c], (i, j), cols_m[:, c] * w)
+
+    add(i0m,     j0m,     w00m)
+    add(i0m + 1, j0m,     w10m)
+    add(i0m,     j0m + 1, w01m)
+    add(i0m + 1, j0m + 1, w11m)
+
+    out = np.zeros((grid.H, grid.W, 3), dtype=np.uint8)
+    ok = wsum > 1e-6
+    out[ok] = (acc[ok] / wsum[ok, None]).clip(0, 255).astype(np.uint8)
+    return out, wsum
+
+
+
 def warp_image_to_bev(
     img_bgr: np.ndarray,
     grid: BEVGrid,
