@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 
 from bev_grid import BEVGrid
+from utils import rescale_intrinsics_to_image
 
 
 def project_ego_points_to_image(
@@ -66,8 +67,8 @@ def splat_image_to_bev_ground(
     roi_vmax: Optional[float] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     ih, iw = img_bgr.shape[:2]
-    K = K.astype(np.float64)
-    Kinv = np.linalg.inv(K)
+    K_use = rescale_intrinsics_to_image(K, iw, ih).astype(np.float64)
+    Kinv = np.linalg.inv(K_use)
 
     # pixel grid (centers)
     us = (np.arange(0, iw, stride, dtype=np.float64) + 0.5)
@@ -128,13 +129,18 @@ def splat_image_to_bev_ground(
     w01 = (1 - di) * dj
     w11 = di * dj
 
-    # sample colors from strided pixel positions matching pix flatten order
-    idx = np.arange(N, dtype=np.int64)
-    u_idx = (idx % w2)
-    v_idx = (idx // w2)
-    u_px = (u_idx * stride).astype(np.int32)
-    v_px = (v_idx * stride).astype(np.int32)
-    cols = img_bgr[v_px, u_px].astype(np.float32)  # (N,3)
+    # Sample colors at the exact same (U,V) coordinates used in pix (subpixel-correct)
+    map_x = U.astype(np.float32)
+    map_y = V.astype(np.float32)
+    sampled = cv2.remap(
+        img_bgr,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+    cols = sampled.reshape(-1, 3).astype(np.float32)  # (N,3)
 
     # apply mask once
     vmask = valid
@@ -174,37 +180,36 @@ def warp_image_to_bev(
     K: np.ndarray,
     T_cam_from_ego: np.ndarray,
     z_plane: float = 0.0,
-    interpolation: int = cv2.INTER_LINEAR,
-    # --- NEW: ROI gating to reduce IPM pinwheel artifacts ---
+    min_depth: float = 1e-6,
     roi_vmin: Optional[float] = None,
     roi_vmax: Optional[float] = None,
     roi_umin: Optional[float] = None,
     roi_umax: Optional[float] = None,
+    interpolation: int = cv2.INTER_LINEAR,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Inverse-perspective mapping (IPM): for each BEV cell center, sample the
-    corresponding camera pixel (u,v) and remap.
+    Inverse-warp an image into a BEV grid by sampling source pixels (cv2.remap).
 
-    NEW: Optional ROI gating in the SOURCE image (u/v) to reduce radial stretching.
-         This is a pragmatic Phase-1 fix for planar IPM: we ignore pixels near the
-         horizon/upper image which tend to be non-ground / far-range and cause
-         strong "pinwheel" smearing.
-
-    Returns:
-      warped_bgr: (H,W,3) uint8
-      valid_mask: (H,W) bool (u/v inside image AND depth positive AND inside ROI)
+    Critical detail:
+      - K MUST match the actual pixel resolution of img_bgr.
+      - If the image was resized/cropped, K must be updated accordingly (or you get pinwheel stretching).
     """
-    pts_ego = grid.ego_points(z=z_plane)  # (H,W,3)
-    u, v, valid = project_ego_points_to_image(pts_ego, K, T_cam_from_ego)  # (H,W)
-
-    u_map = u.astype(np.float32)
-    v_map = v.astype(np.float32)
-
     ih, iw = img_bgr.shape[:2]
 
-    inside = (u_map >= 0.0) & (u_map <= (iw - 1)) & (v_map >= 0.0) & (v_map <= (ih - 1))
+    # --- FIX: ensure intrinsics match the image resolution we're actually sampling ---
+    K_use = rescale_intrinsics_to_image(K, iw, ih)
 
-    # ROI gating (in pixel coordinates)
+    pts_ego = grid.ego_points(z=z_plane)  # (H, W, 3)
+
+    u_map, v_map, valid = project_ego_points_to_image(
+        pts_ego.reshape(-1, 3), K_use, T_cam_from_ego, min_depth=min_depth
+    )
+    u_map = u_map.reshape(grid.H, grid.W).astype(np.float32)
+    v_map = v_map.reshape(grid.H, grid.W).astype(np.float32)
+    valid = valid.reshape(grid.H, grid.W)
+
+    # Optional ROI mask in image coordinates (helps remove sky/hood)
+    inside = np.ones_like(valid, dtype=bool)
     if roi_vmin is not None:
         inside &= (v_map >= float(roi_vmin))
     if roi_vmax is not None:

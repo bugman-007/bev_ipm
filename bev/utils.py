@@ -32,3 +32,33 @@ def invert_se3(T: np.ndarray) -> np.ndarray:
     Ti[:3, :3] = R.T
     Ti[:3, 3] = -R.T @ t
     return Ti
+
+def rescale_intrinsics_to_image(K: np.ndarray, img_w: int, img_h: int) -> np.ndarray:
+    """
+    If K was computed for a different image resolution than the one we're sampling,
+    rescale fx,fy,cx,cy to the actual image size.
+
+    Heuristic:
+      - Assume principal point is near the center.
+      - Infer the "original" size from (cx,cy) ~ (W/2, H/2).
+    """
+    K = np.asarray(K, dtype=np.float64).copy()
+
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+
+    # Infer the calibration image size.
+    # (nuScenes cx,cy are very close to W/2,H/2; if they’re not, we still only use it as a scaling heuristic)
+    w0 = max(1.0, 2.0 * cx)
+    h0 = max(1.0, 2.0 * cy)
+
+    sx = float(img_w) / w0
+    sy = float(img_h) / h0
+
+    # Only apply if there is a meaningful mismatch (avoid tiny float noise)
+    if abs(sx - 1.0) > 1e-2 or abs(sy - 1.0) > 1e-2:
+        K[0, 0] *= sx  # fx
+        K[0, 2] *= sx  # cx
+        K[1, 1] *= sy  # fy
+        K[1, 2] *= sy  # cy
+
+    return K
