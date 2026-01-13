@@ -70,10 +70,16 @@ def stitch_weighted(
     weight_by_cam: Dict[str, np.ndarray],
     feather_px: int = 80,
     weight_blur_sigma: float = 0.0,
+    post_blur_sigma: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Blend warped BEV images using float weight maps (e.g., wsum from splat).
-    This is the correct stitcher for forward-splat pipelines.
+
+    IMPORTANT:
+      - Blurring weights alone does NOT fill splat holes (colors are zero there).
+      - If post_blur_sigma > 0, we apply normalized convolution:
+            acc' = G(acc),  w' = G(wsum),  out = acc'/w'
+        This fills banding/holes much better for forward splats.
 
     Returns:
       stitched_bgr: (H,W,3) uint8
@@ -104,12 +110,17 @@ def stitch_weighted(
                 feather = np.clip(dist / float(feather_px), 0.0, 1.0).astype(np.float32)
                 w = w * feather
 
-        # Optional blur to fill sparse splat holes a bit
+        # Optional blur to soften weights (doesn't fill holes by itself)
         if weight_blur_sigma and weight_blur_sigma > 0:
             w = cv2.GaussianBlur(w, (0, 0), sigmaX=float(weight_blur_sigma), sigmaY=float(weight_blur_sigma))
 
         acc += img.astype(np.float32) * w[..., None]
         wsum += w
+
+    # --- NEW: normalized-convolution reconstruction (fills splat holes/banding) ---
+    if post_blur_sigma and post_blur_sigma > 0:
+        acc = cv2.GaussianBlur(acc, (0, 0), sigmaX=float(post_blur_sigma), sigmaY=float(post_blur_sigma))
+        wsum = cv2.GaussianBlur(wsum, (0, 0), sigmaX=float(post_blur_sigma), sigmaY=float(post_blur_sigma))
 
     stitched = np.zeros((H, W, 3), dtype=np.uint8)
     ok = wsum > eps
