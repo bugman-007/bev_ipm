@@ -62,6 +62,8 @@ def splat_image_to_bev_ground(
     T_ego_from_cam: np.ndarray,   # cam -> ego
     z_plane: float = 0.0,
     stride: int = 2,
+    roi_vmin: Optional[float] = None,
+    roi_vmax: Optional[float] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     ih, iw = img_bgr.shape[:2]
     K = K.astype(np.float64)
@@ -75,6 +77,14 @@ def splat_image_to_bev_ground(
     N = h2 * w2
 
     pix = np.stack([U, V, np.ones_like(U)], axis=-1).reshape(-1, 3).T  # (3, N)
+    
+    # ROI gating in source pixel space (optional, helps reduce far-range smear)
+    valid_roi = np.ones((N,), dtype=bool)
+    v_flat = pix[1, :]  # pixel row coordinate
+    if roi_vmin is not None:
+        valid_roi &= (v_flat >= float(roi_vmin))
+    if roi_vmax is not None:
+        valid_roi &= (v_flat <= float(roi_vmax))
 
     # rays in cam
     d_cam = Kinv @ pix  # (3, N)
@@ -86,7 +96,7 @@ def splat_image_to_bev_ground(
 
     # ray-plane intersection: p = t + s*d, with p_z = z_plane
     denom = d_ego[2, :]  # (N,)
-    valid = np.abs(denom) > 1e-9
+    valid = (np.abs(denom) > 1e-9) & valid_roi
 
     s = np.zeros((N,), dtype=np.float64)
     s[valid] = (float(z_plane) - t[2]) / denom[valid]

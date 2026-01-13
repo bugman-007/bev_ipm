@@ -95,14 +95,18 @@ def main() -> None:
 
     # WARP options (ROI gating in source image to reduce pinwheel artifacts)
     p.add_argument(
-    "--roi_vmin_frac", type=float, default=0.35,
-    help="(warp only) minimum v fraction to KEEP (0..1). "
-         "Example 0.35 keeps bottom 65% of the image (removes horizon)."
+        "--roi_vmin_frac",
+        type=float,
+        default=0.35,
+        help="(warp only) minimum v fraction to KEEP (0..1). "
+             "Example 0.35 keeps bottom 65% of the image (removes horizon).",
     )
     p.add_argument(
-        "--roi_vmax_frac", type=float, default=1.00,
+        "--roi_vmax_frac",
+        type=float,
+        default=1.00,
         help="(warp only) maximum v fraction to KEEP (0..1). "
-            "Example 0.95 removes the bottom 5%."
+             "Example 0.95 removes the bottom 5%.",
     )
 
     args = p.parse_args()
@@ -149,8 +153,8 @@ def main() -> None:
             ih, iw = img.shape[:2]
             roi_vmin = float(args.roi_vmin_frac) * ih if args.roi_vmin_frac is not None else None
             roi_vmax = float(args.roi_vmax_frac) * ih if args.roi_vmax_frac is not None else None
-            # if roi_vmin is not None and roi_vmax is not None and roi_vmin >= roi_vmax:
-            #     raise ValueError(f"Invalid ROI: roi_vmin({roi_vmin}) >= roi_vmax({roi_vmax})")
+            if roi_vmin is not None and roi_vmax is not None and roi_vmin >= roi_vmax:
+                raise ValueError(f"Invalid ROI: roi_vmin({roi_vmin}) >= roi_vmax({roi_vmax})")
 
             warped, valid = warp_image_to_bev(
                 img,
