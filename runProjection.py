@@ -1,37 +1,28 @@
-# runProjection.py  (TOP OF FILE — replace everything from line 1 down through all the imports)
-
 from __future__ import annotations
 
 import os
 import sys
-
-# --- Robust import path setup (fixes ModuleNotFoundError on Windows/EC2) ---
-# Ensure Python can import modules that live either:
-#   1) next to runProjection.py   (./bev_grid.py)
-#   2) inside a subfolder         (./bev/bev_grid.py)
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Always allow importing from the script directory
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-
-# Also allow importing from ./bev even if it's not a Python package (no __init__.py)
-_BEV_DIR = os.path.join(_THIS_DIR, "bev")
-if os.path.isdir(_BEV_DIR) and _BEV_DIR not in sys.path:
-    sys.path.insert(0, _BEV_DIR)
-
 import argparse
-from typing import Optional, List, Dict
+from typing import List, Dict
 
 import numpy as np
 import cv2
 from nuscenes.nuscenes import NuScenes
 
-# Prefer local modules; if they are inside ./bev, the sys.path tweak above covers it.
+# --- Robust import path setup ---
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+_BEV_DIR = os.path.join(_THIS_DIR, "bev")
+if os.path.isdir(_BEV_DIR) and _BEV_DIR not in sys.path:
+    sys.path.insert(0, _BEV_DIR)
+
 from bev_grid import BEVGrid
-from nuscenes_io import init_nuscenes, get_camera_calibration_for_sample
-from stitching import stitch_warped, wsum_to_vis
+from nuscenes_io import get_camera_calibration_for_sample
 from projection import splat_image_to_bev_ground
+from stitching import stitch_weighted, wsum_to_vis
+
 
 CAMERAS: List[str] = [
     "CAM_FRONT",
@@ -82,8 +73,8 @@ def main() -> None:
     p.add_argument("--feather_px", type=int, default=80)
     p.add_argument("--save_per_camera", action="store_true")
     p.add_argument("--save_wsum", action="store_true")
-    p.add_argument("--fill_holes", action="store_true", help="Visual-only: inpaint wsum==0 pixels.")
-    p.add_argument("--inpaint_radius", type=int, default=5)
+    p.add_argument("--stride", type=int, default=2, help="Splat stride (1 = best, slower)")
+    p.add_argument("--z_plane", type=float, default=0.0, help="Ground plane height in ego frame")
     p.add_argument("--no_flip_axes", action="store_true", help="Keep legacy axes (x down, y right).")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
@@ -104,16 +95,6 @@ def main() -> None:
         flip_x=not args.no_flip_axes,
         flip_y=not args.no_flip_axes,
     )
-    
-    if not args.quiet:
-        print("=== BEV grid ===")
-        print(f"Bounds: x[{args.x_min}, {args.x_max}] y[{args.y_min}, {args.y_max}] res={args.res} m/px")
-        print(f"Canvas: H={grid.H} W={grid.W}")
-        print(f"flip_axes: {'NO' if args.no_flip_axes else 'YES'} (forward is {'down' if args.no_flip_axes else 'up'})")
-        pts = grid.ego_points(z=0.0)
-        print(f"Top-left ego point (approx): x={pts[0,0,0]:.3f}, y={pts[0,0,1]:.3f}")
-        print(f"Bottom-right ego point (approx): x={pts[-1,-1,0]:.3f}, y={pts[-1,-1,1]:.3f}")
-
 
     cam_sd_tokens: Dict[str, str] = {cam: sample["data"][cam] for cam in CAMERAS if cam in sample["data"]}
     if not cam_sd_tokens:
@@ -121,8 +102,8 @@ def main() -> None:
 
     calibs = get_camera_calibration_for_sample(nusc, cam_sd_tokens)
 
-    warped_by_cam: Dict[str, any] = {}
-    valid_by_cam: Dict[str, any] = {}
+    warped_by_cam: Dict[str, np.ndarray] = {}
+    weight_by_cam: Dict[str, np.ndarray] = {}
 
     out_dir = args.out_dir or os.path.dirname(args.out)
     _ensure_dir(out_dir)
@@ -135,20 +116,27 @@ def main() -> None:
             raise FileNotFoundError(f"Failed to read image: {data_path}")
 
         calib = calibs[cam]
-        warped, wsum = splat_image_to_bev_ground(img, grid, calib.K, calib.T_ego_from_cam, z_plane=0.0, stride=2)
+
+        warped, wsum_cam = splat_image_to_bev_ground(
+            img,
+            grid,
+            calib.K,
+            calib.T_ego_from_cam,
+            z_plane=float(args.z_plane),
+            stride=int(args.stride),
+        )
 
         warped_by_cam[cam] = warped
-        valid_by_cam[cam] = (wsum > 1e-6)
+        weight_by_cam[cam] = wsum_cam
 
         if args.save_per_camera:
             cv2.imwrite(os.path.join(out_dir, f"{cam}_bev.png"), warped)
 
-    stitched, wsum = stitch_warped(
+    stitched, wsum = stitch_weighted(
         warped_by_cam,
-        valid_by_cam,
+        weight_by_cam,
         feather_px=args.feather_px,
-        fill_holes=args.fill_holes,
-        inpaint_radius=args.inpaint_radius,
+        weight_blur_sigma=1.0,  # try 0.0 / 1.0 / 2.0
     )
 
     cv2.imwrite(out_path, stitched)
