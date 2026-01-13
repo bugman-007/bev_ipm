@@ -75,6 +75,8 @@ def main() -> None:
     p.add_argument("--save_wsum", action="store_true")
     p.add_argument("--stride", type=int, default=2, help="Splat stride (1 = best, slower)")
     p.add_argument("--z_plane", type=float, default=0.0, help="Ground plane height in ego frame")
+    p.add_argument("--fill_holes", action="store_true", help="Visual-only: inpaint wsum==0 pixels.")
+    p.add_argument("--inpaint_radius", type=int, default=5, help="Inpaint radius for hole filling")
     p.add_argument("--no_flip_axes", action="store_true", help="Keep legacy axes (x down, y right).")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
@@ -138,6 +140,14 @@ def main() -> None:
         feather_px=args.feather_px,
         weight_blur_sigma=1.0,  # try 0.0 / 1.0 / 2.0
     )
+
+    # Visual-only (not "geometrically correct") fill for unobserved regions
+    if args.fill_holes:
+        eps = 1e-6
+        ok = wsum > eps
+        if np.any(~ok):
+            hole_mask = (~ok).astype(np.uint8) * 255
+            stitched = cv2.inpaint(stitched, hole_mask, float(args.inpaint_radius), cv2.INPAINT_TELEA)
 
     cv2.imwrite(out_path, stitched)
 
