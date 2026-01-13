@@ -1,240 +1,203 @@
+# runProjection.py  (world-map mosaic runner)
+
 from __future__ import annotations
 
-import os
-import sys
 import argparse
-from typing import List, Dict
+import os
+from typing import Dict, Tuple, Optional
 
-import numpy as np
 import cv2
-from nuscenes.nuscenes import NuScenes
+import numpy as np
 
-# --- Robust import path setup ---
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-if _THIS_DIR not in sys.path:
-    sys.path.insert(0, _THIS_DIR)
-
-_BEV_DIR = os.path.join(_THIS_DIR, "bev")
-if os.path.isdir(_BEV_DIR) and _BEV_DIR not in sys.path:
-    sys.path.insert(0, _BEV_DIR)
-
+from nuscenes_io import (
+    init_nuscenes,
+    resolve_scene_token,
+    CAM_CHANNELS_6,
+    get_camera_calibration_for_sample,
+    get_ego_pose_for_sample_data,
+    iter_scene_samples,
+)
 from bev_grid import BEVGrid
-from nuscenes_io import get_camera_calibration_for_sample
-from projection import splat_image_to_bev_ground, warp_image_to_bev
-from stitching import stitch_weighted, stitch_warped, wsum_to_vis
+from projection import warp_image_to_bev
+from stitching import feather_weight
+from utils import invert_se3
 
 
-CAMERAS: List[str] = [
-    "CAM_FRONT",
-    "CAM_FRONT_RIGHT",
-    "CAM_BACK_RIGHT",
-    "CAM_BACK",
-    "CAM_BACK_LEFT",
-    "CAM_FRONT_LEFT",
-]
+def build_auto_bounds_world(nusc, scene_token: str, pad_m: float = 50.0) -> Tuple[float, float, float, float]:
+    """
+    Auto-compute world XY bounds from the ego trajectory in the scene.
+    """
+    xs, ys = [], []
+    for sample in iter_scene_samples(nusc, scene_token):
+        # Use CAM_FRONT sample_data to grab ego_pose (any camera works)
+        sd_token = sample["data"][CAM_CHANNELS_6[0]]
+        ego_pose = get_ego_pose_for_sample_data(nusc, sd_token)
+        xs.append(float(ego_pose.T_world_from_ego[0, 3]))
+        ys.append(float(ego_pose.T_world_from_ego[1, 3]))
+
+    x_min = min(xs) - pad_m
+    x_max = max(xs) + pad_m
+    y_min = min(ys) - pad_m
+    y_max = max(ys) + pad_m
+    return x_min, x_max, y_min, y_max
 
 
-def _find_scene_by_name(nusc: NuScenes, scene_name: str) -> Dict:
-    for scene in nusc.scene:
-        if scene["name"] == scene_name:
-            return scene
-    raise ValueError(f"Scene '{scene_name}' not found in {nusc.version}.")
+def accumulate_scene_world_bev(
+    nusc,
+    scene_token: str,
+    grid: BEVGrid,
+    start_index: int = 0,
+    end_index: Optional[int] = None,
+    step: int = 1,
+    z_plane_rel_ego: float = 0.0,
+    feather_px: int = 80,
+    roi_vmin: Optional[float] = None,
+    roi_vmax: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Accumulate warped BEV from many frames into a world-frame mosaic.
 
+    CRITICAL FIX:
+      Use ONE constant world Z-plane for the whole scene.
+      If z changes per-frame, projections won't align and the mosaic smears.
+    """
+    acc = np.zeros((grid.H, grid.W, 3), dtype=np.float32)
+    wsum = np.zeros((grid.H, grid.W), dtype=np.float32)
 
-def _sample_token_at_index(nusc: NuScenes, scene_rec: Dict, index: int) -> str:
-    token = scene_rec["first_sample_token"]
-    for _ in range(int(index)):
-        sample = nusc.get("sample", token)
-        nxt = sample["next"]
-        if nxt == "":
-            raise IndexError(f"Scene ended before index={index}.")
-        token = nxt
-    return token
+    # --- pick a single world ground plane Z for the whole scene ---
+    # Use the first valid sample's ego Z as reference (more stable than per-frame).
+    z_plane_world0: Optional[float] = None
 
+    i = 0
+    for sample in iter_scene_samples(nusc, scene_token):
+        if i < start_index:
+            i += 1
+            continue
+        if end_index is not None and i > end_index:
+            break
+        if (i - start_index) % step != 0:
+            i += 1
+            continue
 
-def _ensure_dir(path: str) -> None:
-    if path:
-        os.makedirs(path, exist_ok=True)
+        sd_tokens = {ch: sample["data"][ch] for ch in CAM_CHANNELS_6}
+        calibs = get_camera_calibration_for_sample(nusc, sd_tokens)
 
+        # Initialize constant plane once (first processed frame)
+        if z_plane_world0 is None:
+            sd_token0 = sd_tokens[CAM_CHANNELS_6[0]]
+            ego_pose0 = get_ego_pose_for_sample_data(nusc, sd_token0)
+            z_plane_world0 = float(ego_pose0.T_world_from_ego[2, 3]) + float(z_plane_rel_ego)
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataroot", required=True)
-    p.add_argument("--version", default="v1.0-mini")
-    p.add_argument("--scene", required=True, help="e.g. scene-0061")
-    p.add_argument("--index", type=int, default=0, help="sample index within the scene")
+        for ch in CAM_CHANNELS_6:
+            sd_token = sd_tokens[ch]
+            calib = calibs[ch]
 
-    p.add_argument("--x_min", type=float, default=-30.0)
-    p.add_argument("--x_max", type=float, default=60.0)
-    p.add_argument("--y_min", type=float, default=-30.0)
-    p.add_argument("--y_max", type=float, default=30.0)
-    p.add_argument("--res", type=float, default=0.05)
+            sd = nusc.get("sample_data", sd_token)
+            img_path = os.path.join(nusc.dataroot, sd["filename"])
+            img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                continue
+            ih, iw = img_bgr.shape[:2]
+            # roi_vmin = args.roi_vmin_frac * ih if args.roi_vmin_frac is not None else None
+            # roi_vmax = args.roi_vmax_frac * ih if args.roi_vmax_frac is not None else None
 
-    p.add_argument("--out", default="stitched_bev.png")
-    p.add_argument("--out_dir", default="", help="If set, saves all outputs there.")
+            ego_pose = get_ego_pose_for_sample_data(nusc, sd_token)
+            T_world_from_ego = ego_pose.T_world_from_ego
 
-    p.add_argument("--method", choices=["warp", "splat"], default="warp",
-                   help="warp=reverse mapping (dense IPM), splat=forward splat (sparse)")
-
-    # Common
-    p.add_argument("--z_plane", type=float, default=0.0, help="Ground plane height in ego frame")
-    p.add_argument("--no_flip_axes", action="store_true", help="Keep legacy axes (x down, y right).")
-    p.add_argument("--quiet", action="store_true")
-
-    # Stitching / output
-    p.add_argument("--feather_px", type=int, default=80)
-    p.add_argument("--save_per_camera", action="store_true")
-    p.add_argument("--save_wsum", action="store_true")
-    p.add_argument("--fill_holes", action="store_true", help="Visual-only: inpaint wsum==0 pixels.")
-    p.add_argument("--inpaint_radius", type=int, default=5, help="Inpaint radius for hole filling")
-
-    # SPLAT options
-    p.add_argument("--stride", type=int, default=1, help="Splat stride (1 = best, slower)")
-    p.add_argument("--post_blur_sigma", type=float, default=2.0,
-                   help="(splat only) normalized-convolution blur sigma to fill holes/banding")
-
-    # WARP options (ROI gating in source image to reduce pinwheel artifacts)
-    p.add_argument(
-        "--roi_vmin_frac",
-        type=float,
-        default=0.35,
-        help="(warp only) minimum v fraction to KEEP (0..1). "
-             "Example 0.35 keeps bottom 65% of the image (removes horizon).",
-    )
-    p.add_argument(
-        "--roi_vmax_frac",
-        type=float,
-        default=1.00,
-        help="(warp only) maximum v fraction to KEEP (0..1). "
-             "Example 0.95 removes the bottom 5%.",
-    )
-
-    args = p.parse_args()
-
-    dataroot = os.path.normpath(args.dataroot)
-    nusc = NuScenes(version=args.version, dataroot=dataroot, verbose=not args.quiet)
-
-    scene_rec = _find_scene_by_name(nusc, args.scene)
-    sample_token = _sample_token_at_index(nusc, scene_rec, args.index)
-    sample = nusc.get("sample", sample_token)
-
-    grid = BEVGrid(
-        x_min=args.x_min,
-        x_max=args.x_max,
-        y_min=args.y_min,
-        y_max=args.y_max,
-        res=args.res,
-        flip_x=not args.no_flip_axes,
-        flip_y=not args.no_flip_axes,
-    )
-
-    cam_sd_tokens: Dict[str, str] = {cam: sample["data"][cam] for cam in CAMERAS if cam in sample["data"]}
-    if not cam_sd_tokens:
-        raise RuntimeError("No camera sample_data tokens found for this sample.")
-
-    calibs = get_camera_calibration_for_sample(nusc, cam_sd_tokens)
-
-    out_dir = args.out_dir or os.path.dirname(args.out)
-    _ensure_dir(out_dir)
-    out_path = os.path.join(out_dir, os.path.basename(args.out)) if out_dir else args.out
-
-    if args.method == "warp":
-        warped_by_cam: Dict[str, np.ndarray] = {}
-        valid_by_cam: Dict[str, np.ndarray] = {}
-
-        for cam, sd_token in cam_sd_tokens.items():
-            data_path, _, _ = nusc.get_sample_data(sd_token)
-            img = cv2.imread(data_path, cv2.IMREAD_COLOR)
-            if img is None:
-                raise FileNotFoundError(f"Failed to read image: {data_path}")
-
-            calib = calibs[cam]
-
-            ih, iw = img.shape[:2]
-            roi_vmin = float(args.roi_vmin_frac) * ih if args.roi_vmin_frac is not None else None
-            roi_vmax = float(args.roi_vmax_frac) * ih if args.roi_vmax_frac is not None else None
-            if roi_vmin is not None and roi_vmax is not None and roi_vmin >= roi_vmax:
-                raise ValueError(f"Invalid ROI: roi_vmin({roi_vmin}) >= roi_vmax({roi_vmax})")
+            # cam -> world
+            T_world_from_cam = T_world_from_ego @ calib.T_ego_from_cam
+            # world -> cam
+            T_cam_from_world = invert_se3(T_world_from_cam)
 
             warped, valid = warp_image_to_bev(
-                img,
-                grid,
-                calib.K,
-                calib.T_cam_from_ego,
-                z_plane=float(args.z_plane),
+                img_bgr=img_bgr,
+                grid=grid,
+                K=calib.K,
+                T_cam_from_ego=T_cam_from_world,  # “grid frame → cam frame” (world→cam)
+                z_plane=z_plane_world0,           # <-- constant plane across frames
                 roi_vmin=roi_vmin,
                 roi_vmax=roi_vmax,
             )
 
-            warped_by_cam[cam] = warped
-            valid_by_cam[cam] = valid
+            w = feather_weight(valid, feather_px)
+            acc += warped.astype(np.float32) * w[..., None]
+            wsum += w
 
-            if args.save_per_camera:
-                cv2.imwrite(os.path.join(out_dir, f"{cam}_bev.png"), warped)
+        i += 1
 
-        stitched, wsum = stitch_warped(
-            warped_by_cam,
-            valid_by_cam,
-            feather_px=args.feather_px,
-            fill_holes=args.fill_holes,
-            inpaint_radius=args.inpaint_radius,
-        )
-        cv2.imwrite(out_path, stitched)
+    out = np.zeros((grid.H, grid.W, 3), dtype=np.uint8)
+    ok = wsum > 1e-6
+    out[ok] = (acc[ok] / wsum[ok, None]).clip(0, 255).astype(np.uint8)
+    return out, wsum
 
-        if args.save_wsum:
-            cv2.imwrite(os.path.join(out_dir, "wsum.png"), wsum_to_vis(wsum))
 
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataroot", required=True)
+    ap.add_argument("--version", default="v1.0-mini")
+    ap.add_argument("--scene", required=True, help="scene token or name like scene-0061")
+
+    # Output
+    ap.add_argument("--out_bev", default="world_bev.png")
+    ap.add_argument("--out_wsum", default="world_wsum.png")
+
+    # World grid / bounds
+    ap.add_argument("--res", type=float, default=0.2, help="meters per pixel")
+    ap.add_argument("--pad", type=float, default=60.0, help="padding around trajectory for auto-bounds (m)")
+    ap.add_argument("--x_min", type=float, default=None)
+    ap.add_argument("--x_max", type=float, default=None)
+    ap.add_argument("--y_min", type=float, default=None)
+    ap.add_argument("--y_max", type=float, default=None)
+
+    # Frame range
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--end", type=int, default=None)
+    ap.add_argument("--step", type=int, default=1)
+
+    # Geometry / blending
+    ap.add_argument("--z_plane_rel_ego", type=float, default=0.0)
+    ap.add_argument("--feather_px", type=int, default=80)
+    ap.add_argument("--roi_vmin", type=float, default=None)
+    ap.add_argument("--roi_vmax", type=float, default=None)
+
+    args = ap.parse_args()
+
+    nusc = init_nuscenes(args.dataroot, args.version, verbose=True)
+    scene_token, scene_name = resolve_scene_token(nusc, args.scene)
+    print(f"[INFO] scene={scene_name} token={scene_token}")
+
+    # Auto-bounds unless user provides explicit bounds
+    if args.x_min is None or args.x_max is None or args.y_min is None or args.y_max is None:
+        x_min, x_max, y_min, y_max = build_auto_bounds_world(nusc, scene_token, pad_m=float(args.pad))
     else:
-        # Forward splat (kept for reference / debugging)
-        warped_by_cam: Dict[str, np.ndarray] = {}
-        weight_by_cam: Dict[str, np.ndarray] = {}
+        x_min, x_max, y_min, y_max = args.x_min, args.x_max, args.y_min, args.y_max
 
-        for cam, sd_token in cam_sd_tokens.items():
-            data_path, _, _ = nusc.get_sample_data(sd_token)
-            img = cv2.imread(data_path, cv2.IMREAD_COLOR)
-            if img is None:
-                raise FileNotFoundError(f"Failed to read image: {data_path}")
+    print(f"[INFO] world bounds: x[{x_min:.1f},{x_max:.1f}] y[{y_min:.1f},{y_max:.1f}] res={args.res}")
 
-            calib = calibs[cam]
+    grid = BEVGrid(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, res=float(args.res))
 
-            warped, wsum_cam = splat_image_to_bev_ground(
-                img,
-                grid,
-                calib.K,
-                calib.T_ego_from_cam,
-                z_plane=float(args.z_plane),
-                stride=int(args.stride),
-            )
+    stitched, wsum = accumulate_scene_world_bev(
+        nusc=nusc,
+        scene_token=scene_token,
+        grid=grid,
+        start_index=args.start,
+        end_index=args.end,
+        step=args.step,
+        z_plane_rel_ego=args.z_plane_rel_ego,
+        feather_px=args.feather_px,
+        roi_vmin=args.roi_vmin,
+        roi_vmax=args.roi_vmax,
+    )
 
-            warped_by_cam[cam] = warped
-            weight_by_cam[cam] = wsum_cam
+    cv2.imwrite(args.out_bev, stitched)
+    m = float(np.max(wsum))
+    if m <= 1e-6:
+        wsum_vis = np.zeros_like(wsum, dtype=np.uint8)
+    else:
+        wsum_vis = (np.clip(wsum / m, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-            if args.save_per_camera:
-                cv2.imwrite(os.path.join(out_dir, f"{cam}_bev.png"), warped)
-
-        stitched, wsum = stitch_weighted(
-            warped_by_cam,
-            weight_by_cam,
-            feather_px=args.feather_px,
-            weight_blur_sigma=0.0,            # weight blur alone doesn't fill holes
-            post_blur_sigma=float(args.post_blur_sigma),  # normalized convolution fill
-        )
-
-        if args.fill_holes:
-            eps = 1e-6
-            ok = wsum > eps
-            if np.any(~ok):
-                hole_mask = (~ok).astype(np.uint8) * 255
-                stitched = cv2.inpaint(stitched, hole_mask, float(args.inpaint_radius), cv2.INPAINT_TELEA)
-
-        cv2.imwrite(out_path, stitched)
-
-        if args.save_wsum:
-            cv2.imwrite(os.path.join(out_dir, "wsum.png"), wsum_to_vis(wsum))
-
-    print(f"Saved stitched BEV: {out_path}")
-    if args.save_wsum:
-        print(f"Saved wsum: {os.path.join(out_dir, 'wsum.png')}")
+    cv2.imwrite(args.out_wsum, wsum_vis)
+    print(f"[DONE] wrote {args.out_bev} and {args.out_wsum}")
 
 
 if __name__ == "__main__":

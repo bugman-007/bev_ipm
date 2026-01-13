@@ -208,3 +208,44 @@ def get_camera_calibration_for_sample(
         )
 
     return calibs
+
+@dataclass
+class EgoPose:
+    timestamp: int
+    T_world_from_ego: np.ndarray  # 4x4
+    T_ego_from_world: np.ndarray  # 4x4
+
+
+def get_ego_pose_for_sample_data(nusc: "NuScenes", sample_data_token: str) -> EgoPose:
+    """
+    nuScenes:
+      - sample_data -> ego_pose_token
+      - ego_pose rotation/translation represent ego pose in global/world frame.
+        That is: transforms ego -> world (global).
+    """
+    sd = nusc.get("sample_data", sample_data_token)
+    ep = nusc.get("ego_pose", sd["ego_pose_token"])
+
+    R_world_from_ego = quat_to_rotmat(ep["rotation"])
+    t_world_from_ego = np.array(ep["translation"], dtype=np.float64)
+
+    T_world_from_ego = make_se3(R_world_from_ego, t_world_from_ego)
+    T_ego_from_world = invert_se3(T_world_from_ego)
+
+    return EgoPose(
+        timestamp=int(ep["timestamp"]),
+        T_world_from_ego=T_world_from_ego,
+        T_ego_from_world=T_ego_from_world,
+    )
+
+
+def iter_scene_samples(nusc: "NuScenes", scene_token: str):
+    """
+    Yields samples from first -> last following 'next' pointers.
+    """
+    scene = nusc.get("scene", scene_token)
+    token = scene["first_sample_token"]
+    while token:
+        s = nusc.get("sample", token)
+        yield s
+        token = s["next"]
