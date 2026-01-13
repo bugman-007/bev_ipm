@@ -176,59 +176,60 @@ def splat_image_to_bev_ground(
 
 def warp_image_to_bev(
     img_bgr: np.ndarray,
-    grid: BEVGrid,
+    grid,
     K: np.ndarray,
-    T_cam_from_ego: np.ndarray,
+    T_cam_from_grid: Optional[np.ndarray] = None,
+    *,
+    # Backward/compat convenience: many call sites conceptually pass ego->cam.
+    # Accept either name to avoid keyword mismatch crashes.
+    T_cam_from_ego: Optional[np.ndarray] = None,
     z_plane: float = 0.0,
-    min_depth: float = 1e-6,
-    roi_vmin: Optional[float] = None,
-    roi_vmax: Optional[float] = None,
-    roi_umin: Optional[float] = None,
-    roi_umax: Optional[float] = None,
-    interpolation: int = cv2.INTER_LINEAR,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Inverse-warp an image into a BEV grid by sampling source pixels (cv2.remap).
+    Inverse warp: for each BEV pixel (grid cell center) -> 3D point on z=z_plane in grid frame,
+    transform into camera frame, project to image, then sample via cv2.remap.
 
-    Critical detail:
-      - K MUST match the actual pixel resolution of img_bgr.
-      - If the image was resized/cropped, K must be updated accordingly (or you get pinwheel stretching).
+    Returns:
+      warped_bgr: (H,W,3) uint8
+      valid: (H,W) bool
     """
-    ih, iw = img_bgr.shape[:2]
+    if T_cam_from_grid is None:
+        T_cam_from_grid = T_cam_from_ego
+    if T_cam_from_grid is None:
+        raise ValueError("warp_image_to_bev: provide T_cam_from_grid (or T_cam_from_ego alias)")
 
-    # --- FIX: ensure intrinsics match the image resolution we're actually sampling ---
-    K_use = rescale_intrinsics_to_image(K, iw, ih)
+    H, W = grid.H, grid.W
+    pts_grid = grid.ego_points(z=z_plane).reshape(-1, 3).astype(np.float64)  # (N,3)
 
-    pts_ego = grid.ego_points(z=z_plane)  # (H, W, 3)
+    # grid -> cam
+    ones = np.ones((pts_grid.shape[0], 1), dtype=np.float64)
+    pts_h = np.concatenate([pts_grid, ones], axis=1)                         # (N,4)
+    pts_cam = (T_cam_from_grid @ pts_h.T).T[:, :3]                           # (N,3)
 
-    u_map, v_map, valid = project_ego_points_to_image(
-        pts_ego.reshape(-1, 3), K_use, T_cam_from_ego, min_depth=min_depth
-    )
-    u_map = u_map.reshape(grid.H, grid.W).astype(np.float32)
-    v_map = v_map.reshape(grid.H, grid.W).astype(np.float32)
-    valid = valid.reshape(grid.H, grid.W)
+    # project
+    z = pts_cam[:, 2]
+    valid = z > 1e-6
+    uv = np.zeros((pts_cam.shape[0], 2), dtype=np.float64)
+    if np.any(valid):
+        pc = pts_cam[valid]
+        proj = (K @ pc.T).T
+        uv[valid, 0] = proj[:, 0] / proj[:, 2]
+        uv[valid, 1] = proj[:, 1] / proj[:, 2]
 
-    # Optional ROI mask in image coordinates (helps remove sky/hood)
-    inside = np.ones_like(valid, dtype=bool)
-    if roi_vmin is not None:
-        inside &= (v_map >= float(roi_vmin))
-    if roi_vmax is not None:
-        inside &= (v_map <= float(roi_vmax))
-    if roi_umin is not None:
-        inside &= (u_map >= float(roi_umin))
-    if roi_umax is not None:
-        inside &= (u_map <= float(roi_umax))
-
-    valid_mask = valid & inside
+    map_x = uv[:, 0].reshape(H, W).astype(np.float32)
+    map_y = uv[:, 1].reshape(H, W).astype(np.float32)
 
     warped = cv2.remap(
         img_bgr,
-        u_map,
-        v_map,
-        interpolation=interpolation,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0),
     )
 
-    warped[~valid_mask] = 0
+    h_img, w_img = img_bgr.shape[:2]
+    in_img = (map_x >= 0) & (map_x < (w_img - 1)) & (map_y >= 0) & (map_y < (h_img - 1))
+    valid_mask = in_img & valid.reshape(H, W)
+
     return warped, valid_mask

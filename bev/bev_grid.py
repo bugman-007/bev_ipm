@@ -47,15 +47,22 @@ class BEVGrid:
             ys = ys[::-1].copy()
         return ys
 
-    def ego_points(self, z: float = 0.0) -> np.ndarray:
+    def points(self, z: float = 0.0) -> np.ndarray:
         """
-        Returns (H, W, 3) float32 array of ego-frame points lying on plane z.
+        Returns (H, W, 3) float32 points on plane z in the grid's frame.
+        (This grid frame can be ego OR world.)
         """
         xs = self.x_coords()
         ys = self.y_coords()
         X, Y = np.meshgrid(xs, ys, indexing="ij")  # (H, W)
         Z = np.full_like(X, float(z), dtype=np.float32)
-        return np.stack([X, Y, Z], axis=-1).astype(np.float32)
+        return np.stack([X, Y, Z], axis=-1)
+
+    def ego_points(self, z: float = 0.0) -> np.ndarray:
+        """
+        Backward-compatible alias. Historically this grid was used in ego frame.
+        """
+        return self.points(z=z)
     
     def ego_xy_to_ij(self, X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
